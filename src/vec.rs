@@ -1,10 +1,11 @@
-use std::ptr::{NonNull, self};
-use std::alloc::{self, Layout };
+use std::ptr;
 use std::mem;
 use std::ops::{Deref, DerefMut};
+
+use crate::raw_vec::RawVec;
+
 pub struct Vec<T> {
-    ptr: NonNull<T>,
-    cap: usize,
+    buf: RawVec<T>,
     len: usize,
 }
 
@@ -12,41 +13,15 @@ impl<T> Vec<T> {
     pub fn new() -> Self {
         assert!(std::mem::size_of::<T>() != 0, "no zero type");
         Vec {
-            ptr: NonNull::dangling(),
+            buf: RawVec::new(),
             len: 0,
-            cap: 0,
-        }
-    }
-
-    fn grow(&mut self) {
-        unsafe {
-            let elem_size = mem::size_of::<T>();
-
-            let (new_cap, ptr) = if self.cap == 0 {
-                let layout = Layout::array::<T>(1).unwrap();
-                let ptr = alloc::alloc(layout);
-                (1, ptr)
-            } else {
-                let new_cap = self.cap * 2;
-                let old_num_bytes = self.cap * elem_size;
-                let new_num_bytes = old_num_bytes * 2;
-                //let layout = std::alloc::Layout::new::<T>();
-                let layout = Layout::array::<T>(self.cap).unwrap();
-                let ptr = alloc::realloc(self.ptr.as_ptr() as *mut _, layout, new_num_bytes);
-                (new_cap, ptr)
-            };
-
-            if ptr.is_null() { panic!("oom"); }
-
-            self.ptr = std::ptr::NonNull::<T>::new(ptr as *mut _).unwrap();
-            self.cap = new_cap;
         }
     }
 
     pub fn push(&mut self, elem: T) {
-        if self.len == self.cap { self.grow(); }
+        if self.len == self.buf.cap { self.buf.grow(); }
         unsafe {
-            ptr::write(self.ptr.as_ptr().offset(self.len as isize), elem);
+            ptr::write(self.buf.ptr.as_ptr().offset(self.len as isize), elem);
         }
 
         self.len += 1;
@@ -61,22 +36,22 @@ impl<T> Vec<T> {
 
         let value;
         unsafe {
-            value = self.ptr.as_ptr().offset(self.len as isize).read();
+            value = self.buf.ptr.as_ptr().offset(self.len as isize).read();
         }
         Some(value)
     }
 
     pub fn insert(&mut self, index: usize, elem: T) {
-        if self.len == self.cap { self.grow(); }
+        if self.len == self.buf.cap { self.buf.grow(); }
         unsafe {
             // check overflow index
             if index > self.len { panic!("overflow {}", index)}
 
             let move_count = self.len - index;
             if move_count > 0 {
-                self.ptr.as_ptr().add(index).copy_to(self.ptr.as_ptr().add(index+1), move_count);    
+                self.buf.ptr.as_ptr().add(index).copy_to(self.buf.ptr.as_ptr().add(index+1), move_count);    
             }
-            self.ptr.as_ptr().add(index).write(elem);
+            self.buf.ptr.as_ptr().add(index).write(elem);
             self.len += 1;
         }
     }
@@ -86,11 +61,11 @@ impl<T> Vec<T> {
             if self.len == 0 { panic!("empty"); }
             if index >= self.len { panic!("out of index"); }
 
-            let value = self.ptr.as_ptr().add(index).read();
+            let value = self.buf.ptr.as_ptr().add(index).read();
 
             let move_count = self.len - index - 1;
             if move_count > 0 {
-                self.ptr.as_ptr().add(index+1).copy_to(self.ptr.as_ptr().add(index), move_count);
+                self.buf.ptr.as_ptr().add(index+1).copy_to(self.buf.ptr.as_ptr().add(index), move_count);
             }
             
             self.len -= 1;
@@ -98,18 +73,26 @@ impl<T> Vec<T> {
             value
         }
     }
+
+    pub fn into_iter(self) -> IntoIter<T> {
+        unsafe {
+            let buf = ptr::read(&self.buf);
+            let len = self.len;
+    
+            mem::forget(self);
+
+            IntoIter {
+                start: buf.ptr.as_ptr(),
+                end: buf.ptr.as_ptr().add(len),
+                _buf: buf,
+            }
+        }
+    }
 }
 
 impl<T> Drop for Vec<T> {
     fn drop(&mut self) {
-        if self.cap != 0 {
-            while let Some(_) = self.pop() {}
-
-            let layout = Layout::array::<T>(self.cap).unwrap();
-            unsafe {
-                alloc::dealloc(self.ptr.as_ptr() as *mut _, layout);
-            }
-        }
+        while let Some(_) = self.pop() {}
     }
 }
 
@@ -118,7 +101,7 @@ impl<T> Deref for Vec<T> {
 
     fn deref(&self) -> &Self::Target {
         unsafe {
-            std::slice::from_raw_parts(self.ptr.as_ptr(), self.len)
+            std::slice::from_raw_parts(self.buf.ptr.as_ptr(), self.len)
         }
     }
 }
@@ -127,8 +110,36 @@ impl<T> Deref for Vec<T> {
 impl<T> DerefMut for Vec<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         unsafe {
-            std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len)
+            std::slice::from_raw_parts_mut(self.buf.ptr.as_ptr(), self.len)
         }
+    }
+}
+
+pub struct IntoIter<T> {
+    _buf: RawVec<T>,
+    start: *const T,
+    end: *const T,
+}
+
+impl<T> Iterator for IntoIter<T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.start == self.end {
+            None
+        } else {
+            unsafe {
+                let value = self.start.read();
+                self.start = self.start.add(1);
+                Some(value)
+            }
+        }
+    }
+}
+
+impl<T> Drop for IntoIter<T> {
+    fn drop(&mut self) {
+        while let Some(_) = self.next() {}
     }
 }
 
